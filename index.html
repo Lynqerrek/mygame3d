@@ -1,1 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Massive Muck Island - Advanced Physics & World</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87ceeb; }
+        canvas { display: block; }
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        h3 { margin: 0 0 5px 0; color: #fcd34d; }
+        p { margin: 3px 0; font-size: 13px; opacity: 0.9; }
+        
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 6px;
+            height: 6px;
+            background-color: rgba(255, 255, 255, 0.8);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 10;
+        }
 
+        #blocker {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.6);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-family: sans-serif;
+            z-index: 20;
+            cursor: pointer;
+        }
+        #instructions { font-size: 20px; text-align: center; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <h3>Muck Generator V5</h3>
+        <p> Size: 1000x1000 | 4 Tree Types</p>
+        <p> Features: Dynamic FOV, Gravity, Sliding</p>
+        <p> Physics: Slope & Canopy Collisions</p>
+    </div>
+
+    <div id="crosshair"></div>
+
+    <div id="blocker">
+        <div id="instructions">
+            <span style="font-size:36px; font-weight: bold;">Click to Play</span><br /><br />
+            Move: W, A, S, D<br />
+            Jump: Spacebar<br />
+            Sprint: Shift<br />
+            Look: Mouse
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/PointerLockControls.js"></script>
+
+    <script>
+        // --- MATH & NOISE ---
+        const MathRandom = Math.random;
+        const p = new Uint8Array(512);
+        for (let i = 0; i < 256; i++) p[i] = p[i + 256] = Math.floor(MathRandom() * 256);
+        
+        const lerp = (t, a, b) => a + t * (b - a);
+        const grad = (hash, x, y) => { 
+            const h = hash & 7; 
+            return ((h & 1) ? -x : x) + ((h & 2) ? -2.0 * y : 2.0 * y); 
+        };
+        
+        function noise2D(x, y) {
+            let X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+            x -= Math.floor(x); y -= Math.floor(y);
+            let u = x * x * x * (x * (x * 6 - 15) + 10), v = y * y * y * (y * (y * 6 - 15) + 10);
+            return lerp(v, lerp(u, grad(p[p[X] + Y], x, y), grad(p[p[X + 1] + Y], x - 1, y)), 
+                           lerp(u, grad(p[p[X] + Y + 1], x, y - 1), grad(p[p[X + 1] + Y + 1], x - 1, y - 1)));
+        }
+
+        function fbm(x, z, octaves = 5) {
+            let value = 0, amplitude = 1.0, frequency = 0.003;
+            for (let i = 0; i < octaves; i++) {
+                value += amplitude * noise2D(x * frequency, z * frequency);
+                amplitude *= 0.5;
+                frequency *= 2.5;
+            }
+            return value;
+        }
+
+        // --- CONFIGURATION ---
+        const WORLD_SIZE = 1000;
+        const SEGMENTS = 250;
+        const MAX_HEIGHT = 120;
+        const WATER_LEVEL = 12;
+        
+        // Physics Config
+        const PLAYER_HEIGHT = 1.7; 
+        const PLAYER_RADIUS = 0.4;
+        const WALK_SPEED = 20.0;
+        const SPRINT_SPEED = 38.0;
+        const JUMP_FORCE = 15.0;
+        const GRAVITY = 40.0;
+        const MAX_WALK_SLOPE = 0.75; // Roughly 45 degrees
+        const SPAWN_CLEARANCE = 35.0; // No trees near center
+
+        // --- ELEVATION & NORMAL MATH ---
+        function getElevation(x, z) {
+            let nx = x / (WORLD_SIZE * 0.48);
+            let nz = z / (WORLD_SIZE * 0.48);
+            let dist = Math.sqrt(nx*nx + nz*nz);
+            let falloff = Math.max(0, 1 - dist);
+            falloff = Math.pow(falloff, 1.5); 
+
+            let hNoise = fbm(x, z, 5);
+            let height = ((hNoise + 1) / 2) * MAX_HEIGHT * falloff;
+            if (falloff < 0.1) height = Math.max(0, height * (falloff / 0.1));
+            return height;
+        }
+
+        // Calculates terrain slope (returns vector normal and steepness)
+        function getTerrainData(x, z) {
+            const eps = 0.5;
+            const h = getElevation(x, z);
+            const hx = getElevation(x + eps, z);
+            const hz = getElevation(x, z + eps);
+            const normal = new THREE.Vector3(h - hx, eps, h - hz).normalize();
+            const slope = Math.acos(normal.y); 
+            return { height: h, normal, slope };
+        }
+
+        // --- SPATIAL HASHING (Trunks AND Leaves) ---
+        const spatialGrid = new Map();
+        const GRID_SIZE = 20;
+
+        function getGridKey(x, z) { return `${Math.floor(x / GRID_SIZE)}_${Math.floor(z / GRID_SIZE)}`; }
+
+        function addCollider(x, z, y, trunkRad, leafRad, leafBottom, leafTop) {
+            const key = getGridKey(x, z);
+            if (!spatialGrid.has(key)) spatialGrid.set(key, []);
+            spatialGrid.get(key).push({ x, z, y, trunkRad, leafRad, leafBottom, leafTop });
+        }
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+        scene.fog = new THREE.FogExp2(0x87ceeb, 0.0015);
+
+        const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1500);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- LIGHTING ---
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const sun = new THREE.DirectionalLight(0xfff6e0, 1.2);
+        sun.position.set(300, 500, 200);
+        sun.castShadow = true;
+        sun.shadow.mapSize.width = 2048; 
+        sun.shadow.mapSize.height = 2048;
+        const d = 400;
+        sun.shadow.camera.left = -d; sun.shadow.camera.right = d;
+        sun.shadow.camera.top = d; sun.shadow.camera.bottom = -d;
+        sun.shadow.camera.far = 1000;
+        scene.add(sun);
+
+        // --- TERRAIN ---
+        const terrainGeo = new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE, SEGMENTS, SEGMENTS);
+        terrainGeo.rotateX(-Math.PI / 2);
+        const pos = terrainGeo.attributes.position;
+        const colors = [];
+
+        const cSand = new THREE.Color(0xe6d5a7);
+        const cGrassLight = new THREE.Color(0x60993e);
+        const cGrassDark = new THREE.Color(0x406e29);
+        const cRock = new THREE.Color(0x7a838a);
+        const cSnow = new THREE.Color(0xffffff);
+
+        for (let i = 0; i < pos.count; i++) {
+            let x = pos.getX(i);
+            let z = pos.getZ(i);
+            let height = getElevation(x, z);
+            pos.setY(i, height);
+
+            let texNoise = noise2D(x * 0.2, z * 0.2); 
+            let mixedGrass = cGrassDark.clone().lerp(cGrassLight, (texNoise + 1) / 2);
+
+            if (height <= WATER_LEVEL + 1.5) colors.push(cSand.r, cSand.g, cSand.b);
+            else if (height < MAX_HEIGHT * 0.45) colors.push(mixedGrass.r, mixedGrass.g, mixedGrass.b);
+            else if (height < MAX_HEIGHT * 0.7) {
+                let blend = (height - MAX_HEIGHT * 0.45) / (MAX_HEIGHT * 0.25);
+                let currentMat = mixedGrass.clone().lerp(cRock, blend);
+                colors.push(currentMat.r, currentMat.g, currentMat.b);
+            } else {
+                let blend = (height - MAX_HEIGHT * 0.7) / (MAX_HEIGHT * 0.1);
+                let currentMat = cRock.clone().lerp(cSnow, Math.min(1, blend));
+                colors.push(currentMat.r, currentMat.g, currentMat.b);
+            }
+        }
+        terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        terrainGeo.computeVertexNormals();
+
+        const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.05, flatShading: true });
+        const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+        terrain.receiveShadow = true;
+        scene.add(terrain);
+
+        const waterGeo = new THREE.PlaneGeometry(WORLD_SIZE * 2, WORLD_SIZE * 2);
+        const waterMat = new THREE.MeshStandardMaterial({ color: 0x3d9ca0, roughness: 0.1, transparent: true, opacity: 0.75, flatShading: true });
+        const water = new THREE.Mesh(waterGeo, waterMat);
+        water.rotateX(-Math.PI / 2); water.position.y = WATER_LEVEL;
+        scene.add(water);
+
+        // --- TREES WITH 4 TYPES & CULLING ---
+        const CHUNKS = 4;
+        const TREES_PER_CHUNK = 400;
+        
+        const trunkGeo = new THREE.CylinderGeometry(0.4, 0.7, 4, 5); trunkGeo.translate(0, 2, 0);
+        const birchTrunkGeo = new THREE.CylinderGeometry(0.3, 0.4, 5, 5); birchTrunkGeo.translate(0, 2.5, 0);
+        
+        const oakLeavesGeo = new THREE.DodecahedronGeometry(3.5, 1); oakLeavesGeo.translate(0, 5, 0);
+        const pineLeavesGeo = new THREE.ConeGeometry(3, 9, 5); pineLeavesGeo.translate(0, 6.5, 0);
+        const birchLeavesGeo = new THREE.SphereGeometry(3, 5, 5); birchLeavesGeo.translate(0, 5.5, 0);
+
+        const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3525, flatShading: true }); // Oak/Pine/Dead
+        const birchTrunkMat = new THREE.MeshStandardMaterial({ color: 0xd6d6d6, flatShading: true });
+        const oakMat = new THREE.MeshStandardMaterial({ color: 0x457a2b, flatShading: true });
+        const pineMat = new THREE.MeshStandardMaterial({ color: 0x2d4c1e, flatShading: true });
+        const birchMat = new THREE.MeshStandardMaterial({ color: 0xc4af33, flatShading: true }); // Yellowish green
+
+        const dummy = new THREE.Object3D();
+
+        for (let chunk = 0; chunk < CHUNKS; chunk++) {
+            const cTrunks = new THREE.InstancedMesh(trunkGeo, trunkMat, TREES_PER_CHUNK);
+            const cBirchTrunks = new THREE.InstancedMesh(birchTrunkGeo, birchTrunkMat, Math.floor(TREES_PER_CHUNK / 4));
+            const cOaks = new THREE.InstancedMesh(oakLeavesGeo, oakMat, Math.floor(TREES_PER_CHUNK / 3));
+            const cPines = new THREE.InstancedMesh(pineLeavesGeo, pineMat, Math.floor(TREES_PER_CHUNK / 3));
+            const cBirches = new THREE.InstancedMesh(birchLeavesGeo, birchMat, Math.floor(TREES_PER_CHUNK / 4));
+            
+            cTrunks.castShadow = true; cBirchTrunks.castShadow = true; cOaks.castShadow = true; cPines.castShadow = true; cBirches.castShadow = true;
+
+            let counts = { trunk: 0, bTrunk: 0, oak: 0, pine: 0, birch: 0 };
+
+            for (let i = 0; i < TREES_PER_CHUNK * 15; i++) {
+                if (counts.trunk >= TREES_PER_CHUNK - counts.bTrunk) break;
+
+                let rx = (Math.random() - 0.5) * WORLD_SIZE * 0.9;
+                let rz = (Math.random() - 0.5) * WORLD_SIZE * 0.9;
+                
+                // Spawn Clearance
+                if (Math.hypot(rx, rz) < SPAWN_CLEARANCE) continue;
+
+                let data = getTerrainData(rx, rz);
+                
+                // Steepness Check
+                if (data.height < WATER_LEVEL + 2 || data.height > MAX_HEIGHT * 0.55 || data.slope > MAX_WALK_SLOPE - 0.1) continue;
+
+                let key = getGridKey(rx, rz);
+                let overlap = false;
+                if (spatialGrid.has(key)) {
+                    for (let col of spatialGrid.get(key)) {
+                        if (Math.hypot(col.x - rx, col.z - rz) < 3.5) overlap = true;
+                    }
+                }
+                if (overlap) continue;
+
+                dummy.position.set(rx, data.height, rz);
+                dummy.rotation.y = Math.random() * Math.PI;
+                let scl = 0.7 + Math.random() * 0.6;
+                dummy.scale.set(scl, scl + (Math.random()*0.3), scl);
+                dummy.updateMatrix();
+
+                let type = Math.random();
+                let leafH = 0, leafR = 0, leafTop = 0;
+
+                if (type < 0.35 && counts.oak < cOaks.count) { // Oak
+                    cTrunks.setMatrixAt(counts.trunk++, dummy.matrix);
+                    cOaks.setMatrixAt(counts.oak++, dummy.matrix);
+                    leafH = data.height + (3.5 * scl); leafR = 3.5 * scl; leafTop = data.height + (7 * scl);
+                } else if (type < 0.7 && counts.pine < cPines.count) { // Pine
+                    cTrunks.setMatrixAt(counts.trunk++, dummy.matrix);
+                    cPines.setMatrixAt(counts.pine++, dummy.matrix);
+                    leafH = data.height + (2 * scl); leafR = 3 * scl; leafTop = data.height + (11 * scl);
+                } else if (type < 0.9 && counts.birch < cBirches.count) { // Birch
+                    cBirchTrunks.setMatrixAt(counts.bTrunk++, dummy.matrix);
+                    cBirches.setMatrixAt(counts.birch++, dummy.matrix);
+                    leafH = data.height + (4 * scl); leafR = 3 * scl; leafTop = data.height + (7 * scl);
+                } else { // Dead Tree (Just Trunk)
+                    cTrunks.setMatrixAt(counts.trunk++, dummy.matrix);
+                    leafH = 0; leafR = 0; leafTop = 0; // No leaves to collide with
+                }
+
+                // Add to Physics Grid (Trunk and Canopy)
+                addCollider(rx, rz, data.height, 0.7 * scl, leafR, leafH, leafTop);
+            }
+            scene.add(cTrunks, cBirchTrunks, cOaks, cPines, cBirches);
+        }
+
+        // --- FIRST PERSON PHYSICS CONTROLLER ---
+        const controls = new THREE.PointerLockControls(camera, document.body);
+        const blocker = document.getElementById('blocker');
+
+        blocker.addEventListener('click', () => controls.lock());
+        controls.addEventListener('lock', () => blocker.style.display = 'none');
+        controls.addEventListener('unlock', () => blocker.style.display = 'flex');
+        scene.add(controls.getObject());
+
+        camera.position.set(0, getElevation(0, 0) + PLAYER_HEIGHT, 0);
+
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false, isSprinting = false, canJump = false;
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+
+        document.addEventListener('keydown', (event) => {
+            switch (event.code) {
+                case 'KeyW': moveForward = true; break;
+                case 'KeyA': moveLeft = true; break;
+                case 'KeyS': moveBackward = true; break;
+                case 'KeyD': moveRight = true; break;
+                case 'ShiftLeft': isSprinting = true; break;
+                case 'Space': if (canJump) velocity.y = JUMP_FORCE; canJump = false; break;
+            }
+        });
+
+        document.addEventListener('keyup', (event) => {
+            switch (event.code) {
+                case 'KeyW': moveForward = false; break;
+                case 'KeyA': moveLeft = false; break;
+                case 'KeyS': moveBackward = false; break;
+                case 'KeyD': moveRight = false; break;
+                case 'ShiftLeft': isSprinting = false; break;
+            }
+        });
+
+        // Advanced 3D Collision Detection (Checks Cylinders for trunks, spheres for leaves)
+        function checkCollisions(pos, yHeight) {
+            const rX = Math.floor(pos.x / GRID_SIZE);
+            const rZ = Math.floor(pos.z / GRID_SIZE);
+            
+            for (let i = -1; i <= 1; i++) {
+                for (let j = -1; j <= 1; j++) {
+                    const key = `${rX + i}_${rZ + j}`;
+                    if (spatialGrid.has(key)) {
+                        for (let col of spatialGrid.get(key)) {
+                            let distXZ = Math.hypot(col.x - pos.x, col.z - pos.z);
+                            
+                            // Trunk collision (cylinder)
+                            if (yHeight >= col.y && yHeight <= col.y + 4.5) {
+                                if (distXZ < col.trunkRad + PLAYER_RADIUS) return true;
+                            }
+                            // Canopy collision (leaves)
+                            if (col.leafRad > 0 && yHeight + PLAYER_HEIGHT >= col.leafBottom && yHeight <= col.leafTop) {
+                                if (distXZ < col.leafRad + PLAYER_RADIUS) return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            if (controls.isLocked === true) {
+                // FOV Sprint logic
+                const targetFov = (isSprinting && moveForward) ? 80 : 65;
+                camera.fov = lerp(camera.fov, targetFov, 10 * delta);
+                camera.updateProjectionMatrix();
+
+                // Damping
+                velocity.x -= velocity.x * 8.0 * delta;
+                velocity.z -= velocity.z * 8.0 * delta;
+                velocity.y -= GRAVITY * delta; // Apply Gravity
+
+                const currentX = camera.position.x;
+                const currentY = camera.position.y - PLAYER_HEIGHT;
+                const currentZ = camera.position.z;
+
+                const tData = getTerrainData(currentX, currentZ);
+                const isSteep = tData.slope > MAX_WALK_SLOPE;
+
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveRight) - Number(moveLeft);
+                direction.normalize(); 
+
+                // Only allow WASD movement if not on a steep cliff
+                if (!isSteep) {
+                    const speed = isSprinting ? SPRINT_SPEED : WALK_SPEED;
+                    if (moveForward || moveBackward) velocity.z -= direction.z * speed * delta;
+                    if (moveLeft || moveRight) velocity.x -= direction.x * speed * delta;
+                } else {
+                    // Slide mechanic: Push player down the slope normal
+                    velocity.x += tData.normal.x * GRAVITY * 0.5 * delta;
+                    velocity.z += tData.normal.z * GRAVITY * 0.5 * delta;
+                }
+
+                // Proposed X/Z Movement
+                const inputMoveX = velocity.x * delta;
+                const inputMoveZ = velocity.z * delta;
+
+                // Move X safely
+                controls.moveRight(-inputMoveX);
+                if (checkCollisions(camera.position, currentY)) {
+                    controls.moveRight(inputMoveX); // Revert
+                    velocity.x = 0;
+                }
+
+                // Move Z safely
+                controls.moveForward(-inputMoveZ);
+                if (checkCollisions(camera.position, currentY)) {
+                    controls.moveForward(inputMoveZ); // Revert
+                    velocity.z = 0;
+                }
+
+                // Apply Y Velocity
+                camera.position.y += velocity.y * delta;
+                const groundHeight = getElevation(camera.position.x, camera.position.z);
+                const waterSurface = WATER_LEVEL + 0.5;
+
+                // Ground Collision
+                if (camera.position.y - PLAYER_HEIGHT <= groundHeight) {
+                    velocity.y = 0;
+                    camera.position.y = groundHeight + PLAYER_HEIGHT;
+                    canJump = !isSteep; // Can only jump if flat ground
+                } else {
+                    canJump = false;
+                }
+
+                // Water Swimming
+                if (camera.position.y - PLAYER_HEIGHT < waterSurface) {
+                    velocity.y *= 0.9; // Water drag
+                    if (camera.position.y - PLAYER_HEIGHT <= waterSurface) {
+                        camera.position.y = waterSurface + PLAYER_HEIGHT;
+                        canJump = true; // Can jump out of water
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
